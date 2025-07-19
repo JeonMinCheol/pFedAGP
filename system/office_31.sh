@@ -21,7 +21,7 @@ do
         -algo $algo \
         -gr 100 \
         -go mobilenet_v2 \
-        -ls 1 \
+        -ls 5 \
         -nw 8 \
         -eg 5 \
         -did 0 \
