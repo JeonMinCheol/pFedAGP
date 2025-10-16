@@ -103,7 +103,11 @@ class test(Server):
                 print("\nEvaluate personalized models")
                 self.evaluate(round_num)
 
+                if round_num > 0: 
+                    print("grad mean:", self.aggregator.global_query.grad.abs().mean().item())
+
             # ----------------- Step 1: 클라 학습/집계기 gradient 수집 -----------------
+            ent_losses = []
             proto_grads_list = []
             personalized_protos_list = []
             
@@ -114,6 +118,7 @@ class test(Server):
             for idx, client in enumerate(selected_clients):
                 if client_protos_input is not None:
                     personalized_dict, ent_loss = self.aggregator(client_protos_input, round_num, idx, all_labels)
+                    ent_losses.append(ent_loss)
                     # dict -> [C,D]
                     perC = torch.stack([personalized_dict[lbl] for lbl in all_labels])   # [C, latent_dim]
                     zs_i = zs_cache[idx]                                                 # [C, latent_dim]
@@ -129,10 +134,16 @@ class test(Server):
 
             # (B) 집계기 업데이트 (평균 grad → 한 번만 backward)
             if proto_grads_list:
-                avg_grad = torch.stack(proto_grads_list).mean(dim=0)   # [C,D]
-                target_tensor = personalized_protos_list[0]            # [C,D], requires_grad=True
+                avg_grad = torch.stack(proto_grads_list).mean(dim=0)           # [C,D]
+                avg_ent_loss = torch.stack(ent_losses).mean()                  # [scalar]
+                target_tensor = personalized_protos_list[0]                    # 대표 [C,D]
+
+                # (1) attention backward (client → aggregator)
                 self.agg_opt.zero_grad()
-                torch.autograd.backward(target_tensor, grad_tensors=avg_grad)
+                torch.autograd.backward(target_tensor, grad_tensors=avg_grad, retain_graph=True)
+
+                # (2) entropy regularization backward
+                (0.5 * avg_ent_loss).backward()   
                 self.agg_opt.step()
 
             # ----------------- Step 2: 클라 로컬 프로토 수집 → CP -----------------
@@ -167,8 +178,8 @@ class test(Server):
                 zs = zs.view(M, C, -1)
 
             # === 기존 client_protos_input 을 zc 로 교체 ===
-            client_protos_input = zc.detach()
-            zs_cache = zs.detach()  # 나중에 decode에 사용
+            client_protos_input = zc
+            zs_cache = zs  # 나중에 decode에 사용
 
             # ----------------- Step 4: 각 클라 personalized 생성/전송 -----------------
             for idx, client in enumerate(selected_clients):
@@ -206,7 +217,7 @@ class test(Server):
             client.send_time_cost['total_cost'] += 2 * round_time
 
             print('-' * 50)
-            print(f"[Round {self.current_round}]  disentangle_loss={dis_loss:.4f} attn_loss={ent_loss.item():.6f}, time={self.Budget[-1]:.2f}s")
+            print(f"[Round {self.current_round}]  disentangle_loss={dis_loss:.4f} ent_loss={ent_loss.item():.6f}, time={self.Budget[-1]:.2f}s")
             print('-' * 50)
 
             if self.auto_break and self.check_done(acc_lss=[self.rs_test_acc], top_cnt=self.top_cnt):
