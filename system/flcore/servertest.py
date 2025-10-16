@@ -192,7 +192,9 @@ class test(Server):
             client.send_time_cost['num_rounds'] += 1
             client.send_time_cost['total_cost'] += 2 * round_time
 
-            print('-'*50, self.Budget[-1])
+            print('-' * 50)
+            print(f"[Round {self.current_round}]  attn_loss={avg_grad.item():.6f}, time={self.Budget[-1]:.2f}s")
+            print('-' * 50)
 
             if self.auto_break and self.check_done(acc_lss=[self.rs_test_acc], top_cnt=self.top_cnt):
                 break
