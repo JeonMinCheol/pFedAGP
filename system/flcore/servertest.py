@@ -72,11 +72,14 @@ class ServerPrototypeAggregator(nn.Module):
                 plt.close()
 
         output = {c: attn_out[c] for c in range(C)}
+        attn_entropy = -(attn_weights * (attn_weights.clamp_min(1e-8).log())).sum(dim=-1).mean()
+        attn_loss = attn_entropy
+        
         for lbl in all_labels:
             if lbl not in output:
                 output[lbl] = torch.zeros(self.embed_dim, device=device)
 
-        return output
+        return output, attn_loss
 
 class test(Server):
     def __init__(self, args, times):
@@ -166,7 +169,7 @@ class test(Server):
             for idx, client in enumerate(selected_clients):
                 for step in range(self.agg_steps):
                     self.agg_opt.zero_grad()
-                    personalized = self.aggregator(CP, round_num, idx, all_labels) # client_protos: torch.Tensor, round_num: int, client_idx: int, all_labels):
+                    personalized, attn_loss = self.aggregator(CP, round_num, idx, all_labels) # client_protos: torch.Tensor, round_num: int, client_idx: int, all_labels):
 
                 with torch.no_grad():
                     protos = {}
@@ -193,7 +196,7 @@ class test(Server):
             client.send_time_cost['total_cost'] += 2 * round_time
 
             print('-' * 50)
-            print(f"[Round {self.current_round}]  attn_loss={avg_grad.item():.6f}, time={self.Budget[-1]:.2f}s")
+            print(f"[Round {self.current_round}]  attn_loss={attn_loss.item():.6f}, time={self.Budget[-1]:.2f}s")
             print('-' * 50)
 
             if self.auto_break and self.check_done(acc_lss=[self.rs_test_acc], top_cnt=self.top_cnt):
