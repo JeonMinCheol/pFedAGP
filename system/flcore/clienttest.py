@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from flcore.clients.clientbase import Client
-from utils.loss import SupConLoss
 
 class ClientPrototypeGenerator(nn.Module):
     """
@@ -56,11 +55,8 @@ class clienttest(Client):
 
         self.num_classes = args.num_classes
         self.local_epochs = args.local_epochs
-        self.ce_lambda = args.ce_lambda
-        self.supcon_lambda = args.supcon_lambda
 
         self.criterion_ce = nn.CrossEntropyLoss()
-        self.supcon_loss = SupConLoss(args.tau)
         self.loss_mse = nn.MSELoss()
 
         # self-attention 모듈
@@ -124,42 +120,6 @@ class clienttest(Client):
                 ce_loss.backward()   # ✅ 모델만 업데이트
                 self.optimizer.step()
 
-                # 2) 프로토타입 쪽: 모델 그래프 끊고, external_protos에 대한 grad만 계산
-                if external_protos is not None and proto_labels is not None:
-                    proto_map = {lbl: i for i, lbl in enumerate(proto_labels)}
-                    valid_idx = [i for i, lbl in enumerate(y) if int(lbl.item()) in proto_map]
-                    if valid_idx:
-                        # 모델 경로는 끊고(rep.detach), external_protos로만 미분 걸리게
-                        rep_detached = rep.detach()[valid_idx]                     # [Nv, D]
-                        tix = [proto_map[int(y[i].item())] for i in valid_idx]
-                        target = external_protos[tix]                               # [Nv, D] (requires_grad=True)
-
-                        # proto loss는 external_protos로만 의존하도록 구성
-                        proto_loss = F.mse_loss(rep_detached, target)
-
-                        # external_protos에 대한 gradient를 직접 얻는다
-                        grad_wrt_target = torch.autograd.grad(
-                            proto_loss, target, retain_graph=True, create_graph=False
-                        )[0]                                                        # [Nv, D]
-
-                        # 이제 클래스별로 모아 C×D 형태로 평균 grad를 만든다
-                        C = external_protos.shape[0]
-                        D = external_protos.shape[1]
-                        grad_c_d = torch.zeros(C, D, device=external_protos.device)
-
-                        # 동일 클래스에 여러 샘플이 있으면 평균
-                        for g, cls_idx in zip(grad_wrt_target, tix):
-                            grad_c_d[cls_idx] += g
-                        # 샘플 수로 나누기
-                        count = torch.bincount(torch.tensor(tix, device=grad_c_d.device), minlength=C).clamp_min(1).float()
-                        grad_c_d = grad_c_d / count.unsqueeze(-1)
-
-                        # 누적
-                        if proto_grad_accum is None:
-                            proto_grad_accum = grad_c_d
-                        else:
-                            proto_grad_accum = proto_grad_accum + grad_c_d
-
                 if self.learning_rate_decay:
                     if hasattr(self, 'learning_rate_scheduler'): self.learning_rate_scheduler.step()
 
@@ -167,12 +127,6 @@ class clienttest(Client):
         self.train_time_cost['num_rounds'] += 1
         self.train_time_cost['total_cost'] += time.time() - start_time
         # print(f"Client {self.id}, time: {time.time() - start_time}")
-        if proto_grad_accum is not None:
-            proto_grad_accum = proto_grad_accum / float(self.local_epochs)
-            return proto_grad_accum.detach()
-
-        # 아무 것도 못 모았으면 None
-        return None
 
     def set_protos(self, global_shared):
         """
@@ -232,7 +186,7 @@ class clienttest(Client):
         self.local_personal_protos = personal
         self.protos = full  # 기본 full 구조 사용
 
-        return {"shared": shared, "personal": personal}
+        return {"full": full, "shared": shared, "personal": personal}
 
     def decompose_protos(self, local_protos):
         """
