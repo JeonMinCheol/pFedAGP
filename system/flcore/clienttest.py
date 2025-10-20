@@ -56,6 +56,12 @@ class clienttest(Client):
         self.personalized_protos = {}
         self.local_personal_protos = {}
 
+        D = self.model.head.in_features
+        self.alpha_gate = nn.Sequential(
+            nn.Linear(4*D, D//4), nn.GELU(),
+            nn.Linear(D//4, 1)
+        ).to(self.device)
+
         # ===== NEW: prototype-regularization hyperparams =====
         self.lambda_proto_pull = getattr(args, "lambda_proto_pull", 0.3)  # CE에 더하는 가중치
         self.lambda_proto_ce   = getattr(args, "lambda_proto_ce",   0.1)  # (옵션) 프로토타입 분류 보조 로스
