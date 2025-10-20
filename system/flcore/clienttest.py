@@ -51,7 +51,15 @@ class clienttest(Client):
         self.args = args
         self.id = id
         self.device = torch.device(args.device)
+        self.global_shared = {}
         self.global_protos = {}
+        self.personalized_protos = {}
+        self.local_personal_protos = {}
+
+        # ===== NEW: prototype-regularization hyperparams =====
+        self.lambda_proto_pull = getattr(args, "lambda_proto_pull", 0.3)  # CE에 더하는 가중치
+        self.lambda_proto_ce   = getattr(args, "lambda_proto_ce",   0.1)  # (옵션) 프로토타입 분류 보조 로스
+        self.proto_tau         = getattr(args, "proto_tau", 10.0)         # distance→logit 스케일
 
         self.num_classes = args.num_classes
         self.local_epochs = args.local_epochs
@@ -61,71 +69,130 @@ class clienttest(Client):
 
         # self-attention 모듈
         self.proto_gen = ClientPrototypeGenerator(self.model, num_classes=self.num_classes).to(self.device)
-
-        self.protos_shared = {}
-        self.global_shared = {}
-
-    def calculate_loss(self, external_protos, proto_labels):
-        self.model.eval()
-        proto_map = {lbl: i for i, lbl in enumerate(proto_labels)}
-
-        total_loss = 0.0
-        num_batches = 0
-
-        for x, y in self.load_train_data():
-            x = x.to(self.device, non_blocking=True)
-            y = y.to(self.device, non_blocking=True)
-
-            with torch.no_grad():
-                rep = self.model.base(x)  # [B, D]
-                logits = self.model.head(rep)
-
-            idx = [i for i, lbl in enumerate(y) if lbl.item() in proto_map]
-            if not idx:
-                continue
-
-            reps = rep[idx]
-            tix = [proto_map[y[i].item()] for i in idx]
-            tgt = external_protos[tix]
-
-            # CE + Proto Loss
-            loss_cls = self.loss(logits[idx], y[idx])
-            loss_proto = self.loss_mse(reps, tgt)
-            total_loss += (loss_cls +  loss_proto).item()
-            num_batches += 1
-
-        if num_batches == 0:
-            return 0.0
-
-        mean_loss = total_loss / num_batches
-        return mean_loss  
     
-    def train(self, external_protos=None, proto_labels=None):
+    # 추가
+    def _merge_personalized(self, g, p):
+        g, p = g.view(1,-1), p.view(1,-1)
+        z = torch.cat([g, p, (g-p).abs(), g*p], dim=-1)
+        alpha = torch.sigmoid(self.alpha_gate(z))  # [1,1]
+        return alpha * g + (1 - alpha) * p
+
+    
+    def _get_proto_for_label(self, y_label: int):
+        """
+        personalized_protos > global_protos > None 순서로 프로토를 반환
+        반환 텐서는 [D] or [1,D] 형태 모두 허용
+        """
+        dev = self.device
+        if hasattr(self, "personalized_protos") and self.personalized_protos:
+            p = self.personalized_protos.get(y_label)
+            if isinstance(p, torch.Tensor):
+                return p.to(dev).squeeze(0).detach()
+        if isinstance(self.global_protos, dict) and len(self.global_protos) > 0:
+            g = self.global_protos.get(y_label)
+            if isinstance(g, torch.Tensor):
+                return g.to(dev).squeeze(0).detach()
+        return None
+
+    def _build_proto_logits(self, reps: torch.Tensor, available_protos: dict):
+        """
+        reps: [B, D]
+        available_protos: {cls_id: [1, D] or [D]}
+        return: logits [B, C_avail] (C_avail = len(available_protos))
+        방식: -||x - p_c||^2 * tau  (Prototypical classifier)
+        """
+        if not available_protos:
+            return None, None
+        dev = reps.device
+        classes = sorted(available_protos.keys())
+        protos = [available_protos[c].to(dev).squeeze(0).detach() for c in classes]  # [C, D]
+        P = torch.stack(protos, dim=0)  # [C, D]
+        # dist^2 = ||x||^2 + ||p||^2 - 2 x·p
+        x2 = (reps**2).sum(dim=1, keepdim=True)        # [B,1]
+        p2 = (P**2).sum(dim=1, keepdim=True).T         # [1,C]
+        xp = reps @ P.T                                # [B,C]
+        d2 = x2 + p2 - 2 * xp                          # [B,C]
+        logits = - self.proto_tau * d2                 # [B,C]
+        return logits, classes
+    
+    def train(self):
         trainloader = self.load_train_data()
         self.model.train()
-
-        # proto grad 누적용 버퍼 (없으면 None)
-        proto_grad_accum = None
         start_time = time.time()
 
         for epoch in range(self.local_epochs):
             for x, y in trainloader:
                 x, y = x.to(self.device), y.to(self.device)
-                rep = self.model.base(x)
-                logits = self.model.head(rep)
+                reps = self.model.base(x)           # [B, D]
+                logits = self.model.head(reps)      # [B, K]
 
-                # 1) CE는 기존대로 클라 모델만 업데이트
+                # 1) 기본 CE
                 ce_loss = self.criterion_ce(logits, y)
+
+                # 2) (NEW) Prototype Pull Loss: 각 샘플을 (personalized/global) prototype 쪽으로 당김
+                #    - cosine pull 또는 L2 pull 중 택1 (여기선 cosine 기반을 사용)
+                pull_losses = []
+                with torch.no_grad():
+                    # 미리 배치의 target 프로토 모아두기 (존재하는 것만)
+                    target_protos = []
+                    valid_mask = []
+                    for yy in y.tolist():
+                        p = self._get_proto_for_label(yy)
+                        if p is None:
+                            valid_mask.append(False)
+                            target_protos.append(torch.zeros_like(reps[0]))
+                        else:
+                            valid_mask.append(True)
+                            target_protos.append(p)
+                    target_protos = torch.stack(target_protos, dim=0)  # [B, D]
+                    valid_mask = torch.tensor(valid_mask, device=self.device, dtype=torch.bool)
+
+                if valid_mask.any():
+                    # cosine pull: 1 - cos(rep, proto)
+                    rep_n = F.normalize(reps[valid_mask], dim=-1)
+                    proto_n = F.normalize(target_protos[valid_mask], dim=-1)
+                    cos_pull = 1.0 - (rep_n * proto_n).sum(dim=-1)     # [Bv]
+                    pull_loss = cos_pull.mean()
+                    pull_losses.append(pull_loss)
+
+                # 3) (OPTIONAL) Prototype-based auxiliary CE (protocluster classifier)
+                aux_loss = torch.tensor(0.0, device=self.device)
+                if self.lambda_proto_ce > 0 and hasattr(self, "personalized_protos") and self.personalized_protos:
+                    # 현재 클라가 가진 personalized 프로토만으로 보조 분류
+                    plogits, classes = self._build_proto_logits(reps, self.personalized_protos)
+                    if plogits is not None:
+                        # y를 해당 classes 인덱스로 매핑
+                        class_to_idx = {c: i for i, c in enumerate(classes)}
+                        y_mapped = []
+                        for yy in y.tolist():
+                            if yy in class_to_idx:
+                                y_mapped.append(class_to_idx[yy])
+                            else:
+                                y_mapped.append(-1)  # 없는 클래스는 제외
+                        y_mapped = torch.tensor(y_mapped, device=self.device)
+                        mask = y_mapped >= 0
+                        if mask.any():
+                            aux_loss = self.criterion_ce(plogits[mask], y_mapped[mask])
+
+                # 4) 최종 손실 결합
+                total_loss = ce_loss
+                if pull_losses:
+                    total_loss = total_loss + self.lambda_proto_pull * torch.stack(pull_losses).mean()
+                if self.lambda_proto_ce > 0 and aux_loss.requires_grad or aux_loss.item() != 0.0:
+                    total_loss = total_loss + self.lambda_proto_ce * aux_loss
+
+                # 5) 역전파
                 self.optimizer.zero_grad()
-                ce_loss.backward()   # ✅ 모델만 업데이트
+                total_loss.backward()
                 self.optimizer.step()
 
-                if self.learning_rate_decay:
-                    if hasattr(self, 'learning_rate_scheduler'): self.learning_rate_scheduler.step()
+                if self.learning_rate_decay and hasattr(self, 'learning_rate_scheduler'):
+                    self.learning_rate_scheduler.step()
 
         # 시간·메트릭 저장
         self.train_time_cost['num_rounds'] += 1
         self.train_time_cost['total_cost'] += time.time() - start_time
+
         # print(f"Client {self.id}, time: {time.time() - start_time}")
 
     def set_protos(self, global_shared):
@@ -150,9 +217,8 @@ class clienttest(Client):
             g = self.global_protos[lbl].to(self.device)
             p = self.local_personal_protos[lbl].to(self.device)
 
-            # 어텐션 기반 가중치 (cosine similarity)
-            sim = F.cosine_similarity(g, p, dim=-1, eps=1e-8)
-            alpha = torch.sigmoid(sim).unsqueeze(-1)  # [0,1]
+            # 변경한 부분 cosine simillarity -> 게이팅
+            alpha = self._merge_personalized(g,p)
 
             personalized = alpha * g + (1 - alpha) * p
             self.personalized_protos[lbl] = personalized.detach().cpu()
@@ -186,33 +252,34 @@ class clienttest(Client):
         self.local_personal_protos = personal
         self.protos = full  # 기본 full 구조 사용
 
-        return {"full": full, "shared": shared, "personal": personal}
-
-    def decompose_protos(self, local_protos):
+        return {"full":full, "shared": shared, "personal": personal}
+    
+    def decompose_with_global(self, global_shared):
         """
-        InstanceNorm 기반 프로토타입 분리:
-        각 프로토타입 벡터 p를 평균 μ와 표준편차 σ로 정규화하여
-        shared(μ), personal((p-μ)/σ)로 분리.
+        global_shared: 서버가 보낸 클래스별 global prototype
+        local_personal_protos: 클라이언트의 raw local prototype
         """
-        shared = {}
-        personal = {}
+        self.local_style = {}
+        self.local_content = {}
         eps = 1e-6
 
-        for lbl, proto in local_protos.items():
-            # [D] 혹은 [1, D] 형태로 가정
-            if proto.dim() == 2:
-                proto = proto.squeeze(0)
+        for lbl, local_p in self.local_personal_protos.items():
+            if lbl not in global_shared:
+                continue
+            g = global_shared[lbl].to(self.device)
+            p = local_p.to(self.device)
 
-            mean = proto.mean(dim=0, keepdim=True)
-            std = proto.std(dim=0, keepdim=True) + eps
+            # 1️⃣ Projection: style factor = residual orthogonal to global
+            proj = (p @ g.T) / (g @ g.T + eps) * g
+            style = p - proj
 
-            # 공통(shared): 평균 구조
-            shared[lbl] = mean.expand_as(proto)
+            # 2️⃣ Normalization
+            style = style / (style.norm(dim=-1, keepdim=True) + eps)
 
-            # 개인(personal): Instance-normalized residual
-            personal[lbl] = (proto - mean) / std
+            self.local_content[lbl] = g.detach()
+            self.local_style[lbl] = style.detach()
 
-        return shared, personal
+        return self.local_content, self.local_style
 
     def train_metrics(self):
         trainloader = self.load_train_data()
@@ -233,7 +300,6 @@ class clienttest(Client):
                 output = self.model.head(rep)
                 loss = self.loss(output, y)
 
-                # incorporate prototype regularization
                 if isinstance(self.global_protos, dict) and len(self.global_protos) > 0:
                     proto_new = rep.detach().clone()
                     for i, yy in enumerate(y):
