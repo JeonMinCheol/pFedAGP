@@ -41,7 +41,8 @@ from flcore.servers.serverfml import FML
 from flcore.servers.serverkd import FedKD
 from flcore.servers.serverpcl import FedPCL
 from flcore.servers.servercp import FedCP
-from flcore.servers.serverpFedAGP import pFedAGP
+from flcore.servers.serverstar import FedSTAR
+from flcore.servers.serverablation import ablation
 
 from flcore.trainmodel.models import *
 
@@ -49,9 +50,8 @@ from flcore.trainmodel.bilstm import *
 from flcore.trainmodel.resnet import *
 from flcore.trainmodel.alexnet import *
 from flcore.trainmodel.mobilenet_v2 import *
+from flcore.trainmodel.mobilenet_v3 import *
 from flcore.trainmodel.transformer import *
-
-from utils.result_utils import average_data
 # from utils.mem_utils import MemReporter
 
 
@@ -134,11 +134,10 @@ def run(args):
 
         elif model_str == "mobilenet_v2":
             args.model = mobilenet_v2(pretrained=False, num_classes=args.num_classes).to(args.device)
-            
-            # args.model = mobilenet_v2(pretrained=True).to(args.device)
-            # feature_dim = list(args.model.fc.parameters())[0].shape[1]
-            # args.model.fc = nn.Linear(feature_dim, args.num_classes).to(args.device)
-            
+        
+        elif model_str == "mobilenet_v3":
+            args.model = mobilenet_v3_ultralite(pretrained=False, num_classes=args.num_classes).to(args.device)
+
         elif model_str == "lstm":
             args.model = LSTMNet(hidden_dim=emb_dim, vocab_size=vocab_size, num_classes=args.num_classes).to(args.device)
 
@@ -179,11 +178,17 @@ def run(args):
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedAvg(args, i)
 
-        elif args.algorithm == "pFedAGP":
+        elif args.algorithm == "FedSTAR":
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
-            server = pFedAGP(args, i)
+            server = FedSTAR(args, i)
+
+        elif args.algorithm == "ablation":
+            args.head = copy.deepcopy(args.model.fc)
+            args.model.fc = nn.Identity()
+            args.model = BaseHeadSplit(args.model, args.head)
+            server = ablation(args, i)
 
         elif args.algorithm == "Local":
             server = Local(args, i)
@@ -430,7 +435,7 @@ if __name__ == "__main__":
     # APFL
     parser.add_argument('-al', "--alpha", type=float, default=1.0)
     # Ditto / FedRep
-    parser.add_argument('-pls', "--plocal_steps", type=int, default=5)
+    parser.add_argument('-pls', "--plocal_steps", type=int, default=3)
     parser.add_argument('-dmu', "--ditto_mu", type=int, default=1)
     # MOON
     parser.add_argument('-tau', "--tau", type=float, default=1.0)
@@ -457,18 +462,10 @@ if __name__ == "__main__":
     parser.add_argument('-Ts', "--T_start", type=float, default=0.95)
     parser.add_argument('-Te', "--T_end", type=float, default=0.98)
     # pFedAGP
-    parser.add_argument('-ags', '--agg_steps', type=int, default=5,
-                    help='number of local update steps for the server prototype aggregator')
-    parser.add_argument('-ats', '--attn_steps', type=int, default=3,
-                    help='number of local update steps for the clients prototype generator')
-    parser.add_argument('-alr', '--attn_lr', type=float, default=0.001,
-                    help='number of local learning rate for the clients prototype generator')
-    parser.add_argument('-celam', '--ce_lambda', type=float, default=10)
-    parser.add_argument('-entlam', '--ent_lambda', type=float, default=1)
-    parser.add_argument('-suplam', '--supcon_lambda', type=float, default=0.5)
-    parser.add_argument('-entt', '--ent_threshold', type=float, default=0.4)
-    parser.add_argument('-temp', '--init_temp', type=float, default=0.45)
-
+    parser.add_argument('-le', "--ent_lambda", type=float, default=1.0)
+    parser.add_argument('-nl', "--num_layers", type=int, default=1)
+    parser.add_argument('-lsc', "--loss_scale", type=float, default=100)
+    
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
@@ -516,12 +513,7 @@ if __name__ == "__main__":
     print("Total number of new clients: {}".format(args.num_new_clients))
     print("Fine tuning epoches on new clients: {}".format(args.fine_tuning_epoch))
     print("Dirchlet rate: {}".format(args.dirchlet))
-    print("CE_lambda rate: {}".format(args.ce_lambda))
-    print("Aggregation step: {}".format(args.agg_steps))
-    print("Entropy lambda: {}".format(args.ent_lambda))
-    print("Supcon lambda: {}".format(args.supcon_lambda))
-    print("Entropy threshold: {}".format(args.ent_threshold))
-    print("Attention temperature: {}".format(args.init_temp))
+    print("Transformer layers: {}".format(args.num_layers))
     print("=" * 50)
 
     run(args)
